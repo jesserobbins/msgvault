@@ -132,7 +132,9 @@ func TestClient_Embed_Does_Not_Retry_4xx(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
-		http.Error(w, "bad request", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"No models loaded"}`))
 	}))
 	defer srv.Close()
 
@@ -146,6 +148,9 @@ func TestClient_Embed_Does_Not_Retry_4xx(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "400") {
 		t.Errorf("error %q should include status 400", err.Error())
+	}
+	if !strings.Contains(err.Error(), "No models loaded") {
+		t.Errorf("error %q should include response body", err.Error())
 	}
 }
 
@@ -442,6 +447,65 @@ func TestClient_Embed_RetryAfterZero_RetriesImmediately(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Errorf("calls=%d, want 2", calls)
+	}
+}
+
+func TestClient_Embed_4xxIsPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"Invalid input"}}`, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{
+		Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 3,
+	})
+	_, err := c.Embed(context.Background(), []string{"hello"})
+	if err == nil {
+		t.Fatalf("expected error on 400")
+	}
+	if !errors.Is(err, ErrPermanent4xx) {
+		t.Fatalf("expected errors.Is(err, ErrPermanent4xx), got %v", err)
+	}
+	// Existing contract: body must still be in the message.
+	if !strings.Contains(err.Error(), "Invalid input") {
+		t.Errorf("expected body in error, got %v", err)
+	}
+}
+
+func TestClient_Embed_5xxNotPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{
+		Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 2,
+	})
+	_, err := c.Embed(context.Background(), []string{"hello"})
+	if err == nil {
+		t.Fatalf("expected error after retries exhausted")
+	}
+	if errors.Is(err, ErrPermanent4xx) {
+		t.Fatalf("5xx should NOT match ErrPermanent4xx, got %v", err)
+	}
+}
+
+func TestClient_Embed_429NotPermanent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{
+		Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 2,
+	})
+	_, err := c.Embed(context.Background(), []string{"hello"})
+	if err == nil {
+		t.Fatalf("expected error after retries exhausted")
+	}
+	if errors.Is(err, ErrPermanent4xx) {
+		t.Fatalf("429 should NOT match ErrPermanent4xx, got %v", err)
 	}
 }
 

@@ -24,6 +24,7 @@ var (
 	importEmlxAccountsDB         string
 	importEmlxAccounts           []string
 	importEmlxIdentifier         string
+	noDefaultIdentityImportEmlx  bool
 )
 
 var importEmlxCmd = &cobra.Command{
@@ -159,6 +160,9 @@ Examples:
 		if err := st.InitSchema(); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
+		if err := runStartupMigrations(st); err != nil {
+			return fmt.Errorf("startup migrations: %w", err)
+		}
 
 		attachmentsDir := cfg.AttachmentsDir()
 		if importEmlxNoAttachments {
@@ -197,6 +201,14 @@ func importSingleAccount(
 	)
 	if err != nil {
 		return err
+	}
+
+	if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportEmlx {
+		if summary.SourceID != 0 {
+			confirmDefaultIdentity(st, summary.SourceID, identifier, identifier, "account-identifier")
+		} else {
+			logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
+		}
 	}
 
 	printImportSummary(cmd, ctx, *summary)
@@ -311,6 +323,18 @@ func importAutoAccounts(
 		if summary.MailboxesTotal == 0 {
 			_, _ = fmt.Fprintf(out, "Skipping %s: no mailboxes found\n", identifier)
 			continue
+		}
+
+		if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportEmlx {
+			accountDisplay := account.Identifier()
+			if account.Email != "" {
+				accountDisplay = account.Email
+			}
+			if summary.SourceID != 0 {
+				confirmDefaultIdentity(st, summary.SourceID, accountDisplay, identifier, "account-identifier")
+			} else {
+				logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
+			}
 		}
 
 		printImportSummary(cmd, ctx, *summary)
@@ -433,5 +457,9 @@ func init() {
 	importEmlxCmd.Flags().StringVar(
 		&importEmlxIdentifier, "identifier", "",
 		"Explicit email/identifier for single-directory import (manual fallback)",
+	)
+	importEmlxCmd.Flags().BoolVar(
+		&noDefaultIdentityImportEmlx, "no-default-identity", false,
+		noDefaultIdentityHelp,
 	)
 }

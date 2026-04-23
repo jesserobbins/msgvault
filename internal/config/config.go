@@ -70,6 +70,11 @@ type RemoteConfig struct {
 }
 
 // Config represents the msgvault configuration.
+// IdentityConfig holds the user's curated identity addresses.
+type IdentityConfig struct {
+	Addresses []string `toml:"addresses"`
+}
+
 type Config struct {
 	Data      DataConfig        `toml:"data"`
 	Log       LogConfig         `toml:"log"`
@@ -80,6 +85,7 @@ type Config struct {
 	Server    ServerConfig      `toml:"server"`
 	Remote    RemoteConfig      `toml:"remote"`
 	Vector    vector.Config     `toml:"vector"`
+	Identity  IdentityConfig    `toml:"identity"`
 	Accounts  []AccountSchedule `toml:"accounts"`
 
 	// Computed paths (not from config file)

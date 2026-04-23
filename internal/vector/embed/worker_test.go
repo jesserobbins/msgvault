@@ -4,6 +4,7 @@ package embed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -496,6 +497,7 @@ func TestWorker_OrphanCompleteFailureDoesNotStrandValidWork(t *testing.T) {
 		t.Fatalf("install trigger: %v", err)
 	}
 
+	var reports []ProgressReport
 	w := NewWorker(WorkerDeps{
 		Backend:                f.Backend,
 		VectorsDB:              f.VectorsDB,
@@ -503,6 +505,10 @@ func TestWorker_OrphanCompleteFailureDoesNotStrandValidWork(t *testing.T) {
 		Client:                 f.FakeClient,
 		BatchSize:              2,
 		MaxConsecutiveFailures: 5, // generous so the orphan drain failure does not abort mid-loop
+		TotalPending:           2,
+		Progress: func(p ProgressReport) {
+			reports = append(reports, p)
+		},
 	})
 
 	res, err := w.RunOnce(ctx, f.BuildingGen)
@@ -520,6 +526,16 @@ func TestWorker_OrphanCompleteFailureDoesNotStrandValidWork(t *testing.T) {
 	}
 	if res.Failed == 0 {
 		t.Errorf("Failed=%d, want > 0 (orphan drain failure should be reported)", res.Failed)
+	}
+	if len(reports) == 0 {
+		t.Fatalf("expected progress for valid embedded row even though orphan drain failed")
+	}
+	final := reports[len(reports)-1]
+	if final.Done != 1 {
+		t.Errorf("final progress Done=%d, want 1 durable embedded row", final.Done)
+	}
+	if final.BatchMsgs != 1 {
+		t.Errorf("final progress BatchMsgs=%d, want 1 durable embedded row", final.BatchMsgs)
 	}
 
 	// The valid message's pending row must be GONE (Complete succeeded).
@@ -614,5 +630,443 @@ func TestWorker_MissingMessagesDrainedFromQueue(t *testing.T) {
 	}
 	if embedded != 1 {
 		t.Errorf("embeddings = %d, want 1", embedded)
+	}
+}
+
+// TestWorker_EmptyPreprocessedMessagesDrainedFromQueue verifies that
+// messages whose content is stripped to empty are dropped from the
+// queue instead of being sent to embedders that reject empty inputs.
+func TestWorker_EmptyPreprocessedMessagesDrainedFromQueue(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 0)
+
+	// Message 1 becomes empty after quote stripping; message 2 remains
+	// embeddable so the batch must still succeed.
+	if _, err := f.MainDB.ExecContext(ctx,
+		`INSERT INTO messages (id, subject) VALUES (1, ''), (2, 'kept')`); err != nil {
+		t.Fatalf("insert messages: %v", err)
+	}
+	if _, err := f.MainDB.ExecContext(ctx,
+		`INSERT INTO message_bodies (message_id, body_text) VALUES
+		 (1, '> quoted only'),
+		 (2, 'actual body')`); err != nil {
+		t.Fatalf("insert bodies: %v", err)
+	}
+	if _, err := f.VectorsDB.ExecContext(ctx,
+		`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at) VALUES
+		 (?, 1, 0),
+		 (?, 2, 0)`,
+		int64(f.BuildingGen), int64(f.BuildingGen)); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+
+	w := NewWorker(WorkerDeps{
+		Backend:       f.Backend,
+		VectorsDB:     f.VectorsDB,
+		MainDB:        f.MainDB,
+		Client:        f.FakeClient,
+		Preprocess:    PreprocessConfig{StripQuotes: true},
+		MaxInputChars: 8000,
+		BatchSize:     2,
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Succeeded != 1 {
+		t.Errorf("Succeeded=%d, want 1", res.Succeeded)
+	}
+	if len(f.FakeClient.LastInputs) != 1 {
+		t.Fatalf("captured %d inputs, want 1", len(f.FakeClient.LastInputs))
+	}
+	if got := f.FakeClient.LastInputs[0]; strings.TrimSpace(got) == "" {
+		t.Fatalf("embedder received empty input %q", got)
+	}
+
+	var pending int
+	if err := f.VectorsDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`,
+		int64(f.BuildingGen)).Scan(&pending); err != nil {
+		t.Fatalf("count pending: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("pending after drain = %d, want 0", pending)
+	}
+
+	var embedded int
+	if err := f.VectorsDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM embeddings WHERE generation_id = ?`,
+		int64(f.BuildingGen)).Scan(&embedded); err != nil {
+		t.Fatalf("count embeddings: %v", err)
+	}
+	if embedded != 1 {
+		t.Errorf("embeddings = %d, want 1", embedded)
+	}
+}
+
+// Progress fires once per fully-successful batch and carries cumulative
+// Done, batch size, and char counts — enough for an ETA printer to work
+// off of without peeking at worker internals.
+func TestWorker_ProgressCalledPerSuccessfulBatch(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 5)
+
+	var reports []ProgressReport
+	w := NewWorker(WorkerDeps{
+		Backend:       f.Backend,
+		VectorsDB:     f.VectorsDB,
+		MainDB:        f.MainDB,
+		Client:        f.FakeClient,
+		Preprocess:    PreprocessConfig{},
+		MaxInputChars: 8000,
+		BatchSize:     2,
+		TotalPending:  5,
+		Progress: func(p ProgressReport) {
+			reports = append(reports, p)
+		},
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Succeeded != 5 {
+		t.Fatalf("succeeded=%d, want 5", res.Succeeded)
+	}
+	// 5 messages, batch=2 → batches of 2, 2, 1 → three Progress calls.
+	if len(reports) != 3 {
+		t.Fatalf("progress called %d times, want 3", len(reports))
+	}
+
+	wantDone := []int{2, 4, 5}
+	wantBatchMsgs := []int{2, 2, 1}
+	for i, p := range reports {
+		if p.Done != wantDone[i] {
+			t.Errorf("report[%d].Done=%d, want %d", i, p.Done, wantDone[i])
+		}
+		if p.BatchMsgs != wantBatchMsgs[i] {
+			t.Errorf("report[%d].BatchMsgs=%d, want %d", i, p.BatchMsgs, wantBatchMsgs[i])
+		}
+		if p.TotalPending != 5 {
+			t.Errorf("report[%d].TotalPending=%d, want 5", i, p.TotalPending)
+		}
+		if p.BatchChars <= 0 {
+			t.Errorf("report[%d].BatchChars=%d, want >0 (non-empty fixture bodies)", i, p.BatchChars)
+		}
+		if p.BatchElapsed < 0 {
+			t.Errorf("report[%d].BatchElapsed=%s, want >=0", i, p.BatchElapsed)
+		}
+		if p.RunElapsed < p.BatchElapsed {
+			t.Errorf("report[%d].RunElapsed=%s < BatchElapsed=%s", i, p.RunElapsed, p.BatchElapsed)
+		}
+	}
+}
+
+func TestWorker_ProgressCountsDroppedRowsTowardTotal(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 3)
+
+	const missingID = 2
+	if _, err := f.MainDB.ExecContext(ctx,
+		`DELETE FROM messages WHERE id = ?`, missingID); err != nil {
+		t.Fatalf("delete missing message: %v", err)
+	}
+	if _, err := f.MainDB.ExecContext(ctx,
+		`DELETE FROM message_bodies WHERE message_id = ?`, missingID); err != nil {
+		t.Fatalf("delete missing body: %v", err)
+	}
+
+	var reports []ProgressReport
+	w := NewWorker(WorkerDeps{
+		Backend:       f.Backend,
+		VectorsDB:     f.VectorsDB,
+		MainDB:        f.MainDB,
+		Client:        f.FakeClient,
+		MaxInputChars: 8000,
+		BatchSize:     3,
+		TotalPending:  3,
+		Progress: func(p ProgressReport) {
+			reports = append(reports, p)
+		},
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Succeeded != 2 {
+		t.Fatalf("succeeded=%d, want 2 embedded rows", res.Succeeded)
+	}
+	if len(reports) == 0 {
+		t.Fatalf("expected progress report for mixed embed/drop batch")
+	}
+	final := reports[len(reports)-1]
+	if final.Done != 3 {
+		t.Fatalf("final progress Done=%d, want 3 pending rows processed", final.Done)
+	}
+	if final.BatchMsgs != 3 {
+		t.Fatalf("final progress BatchMsgs=%d, want 3 pending rows processed in batch", final.BatchMsgs)
+	}
+}
+
+// TestWorker_DownshiftDrain_HappyPath_AllSingletonsSucceed verifies
+// that when a multi-message batch returns ErrPermanent4xx (e.g. one
+// message in the batch is too long for the model), the worker walks
+// the same already-claimed IDs one at a time and embeds the rest.
+func TestWorker_DownshiftDrain_HappyPath_AllSingletonsSucceed(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: too long: %w", ErrPermanent4xx)
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Succeeded != 3 {
+		t.Fatalf("Succeeded: got %d, want 3", res.Succeeded)
+	}
+	if res.Failed != 0 {
+		t.Fatalf("Failed: got %d, want 0", res.Failed)
+	}
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
+}
+
+// TestWorker_DownshiftDrain_PartialDrop verifies that singleton 4xxs
+// inside a drain are dropped (Completed without an embedding) while
+// the rest of the drain proceeds normally.
+func TestWorker_DownshiftDrain_PartialDrop(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	var singletonSeen int
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: too long: %w", ErrPermanent4xx)
+		}
+		singletonSeen++
+		if singletonSeen == 2 {
+			return nil, fmt.Errorf("embed: HTTP 400: blocked: %w", ErrPermanent4xx)
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Succeeded != 2 {
+		t.Errorf("Succeeded: got %d, want 2", res.Succeeded)
+	}
+	// Singleton 4xx drops are NOT counted as Failed — Complete
+	// succeeded, so the worker treated the unembeddable message
+	// the same way the main loop treats missing/empty drops.
+	// res.Failed is reserved for genuine processing failures
+	// (Complete errors, transient embed failures, etc.).
+	if res.Failed != 0 {
+		t.Errorf("Failed (no Complete errors expected): got %d, want 0", res.Failed)
+	}
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
+}
+
+// TestWorker_DownshiftDrain_AllDrop_StillTripsCap verifies that a
+// fully misconfigured endpoint (every message rejected as 4xx) still
+// trips the consecutive-failure cap so the worker aborts instead of
+// silently dropping every message.
+func TestWorker_DownshiftDrain_AllDrop_StillTripsCap(t *testing.T) {
+	f := newWorkerFixture(t, 6)
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		return nil, fmt.Errorf("embed: HTTP 400: misconfigured: %w", ErrPermanent4xx)
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:                f.Backend,
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              3,
+		MaxConsecutiveFailures: 2,
+	})
+	_, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err == nil {
+		t.Fatalf("expected abort error, got nil")
+	}
+	if !strings.Contains(err.Error(), "consecutive failures") {
+		t.Errorf("expected abort message, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "misconfigured") {
+		t.Errorf("expected original 4xx body in error, got %v", err)
+	}
+}
+
+// TestWorker_DownshiftDrain_AllDropClean_NoSilentDelete covers the
+// most dangerous failure mode: a misconfigured endpoint (bad API
+// key, wrong model, malformed shared request config) returns 4xx
+// for every input. ErrPermanent4xx is indistinguishable from a
+// message-specific 4xx at the call site, so the worker MUST NOT
+// Complete-delete pending rows when no singleton in the drain
+// embedded — it must release them so the cap eventually trips and
+// the operator sees the failure with the original 4xx body intact
+// AND the rows still in the queue for retry after fixing the
+// config.
+func TestWorker_DownshiftDrain_AllDropClean_NoSilentDelete(t *testing.T) {
+	f := newWorkerFixture(t, 4)
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		return nil, fmt.Errorf("embed: HTTP 401: bad-api-key: %w", ErrPermanent4xx)
+	}
+	// BatchSize=2, default MaxConsecutiveFailures=5. Each iteration:
+	// upstream 4xx (cf+1), drain walks both singletons, both 4xx,
+	// drain returns wrapped ErrPermanent4xx (no double-count since
+	// the drain confirms the upstream failure rather than adding a
+	// new one), drain releases the 2 deferred IDs back to the queue.
+	// After 5 iterations the cap trips. Pending count stays at 4
+	// throughout because rows are released, not Completed.
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 2,
+	})
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err == nil {
+		t.Fatalf("expected cap-trip error on misconfigured endpoint, got nil")
+	}
+	if res.Succeeded != 0 {
+		t.Errorf("Succeeded: got %d, want 0 (no embeds during all-drop)", res.Succeeded)
+	}
+	if !strings.Contains(err.Error(), "consecutive failures") {
+		t.Errorf("expected cap-trip error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "bad-api-key") {
+		t.Errorf("expected original 4xx body in error, got %v", err)
+	}
+	// Critical: rows must NOT have been silently deleted. They
+	// should still be in pending_embeddings (released back, not
+	// Completed) so a corrected config can re-claim them on the
+	// next run.
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 4)
+}
+
+// TestWorker_SingletonBatch_4xx_NoSilentDelete verifies that a
+// BatchSize=1 claim returning ErrPermanent4xx does NOT silently
+// delete the row. The drain walks the single ID, defers the drop,
+// finds embedded == 0, releases the row back to the queue, and
+// returns the wrapped 4xx. The caller sees errors.Is(err,
+// ErrPermanent4xx) so the drain return doesn't double-count, but
+// the upstream batch failure still increments consecutiveFailures
+// once per iteration. With MaxConsecutiveFailures=3 the cap trips
+// after 3 iterations and the row remains in pending_embeddings.
+func TestWorker_SingletonBatch_4xx_NoSilentDelete(t *testing.T) {
+	f := newWorkerFixture(t, 1)
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		return nil, fmt.Errorf("embed: HTTP 400: bad: %w", ErrPermanent4xx)
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:                f.Backend,
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              1,
+		MaxConsecutiveFailures: 3,
+	})
+	_, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err == nil {
+		t.Fatalf("expected abort after cap, got nil")
+	}
+	if !strings.Contains(err.Error(), "consecutive failures") {
+		t.Errorf("expected cap abort message, got %v", err)
+	}
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 1)
+}
+
+// TestWorker_DownshiftDrain_CtxCancelMidDrain verifies that
+// cancellation during the drain returns ctx.Err() and the remaining
+// claimed rows are not lost (they remain in pending_embeddings to be
+// recovered by ReclaimStale).
+func TestWorker_DownshiftDrain_CtxCancelMidDrain(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	var singletonCalls int
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: %w", ErrPermanent4xx)
+		}
+		singletonCalls++
+		if singletonCalls == 2 {
+			cancel()
+			return nil, context.Canceled
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+	_, err := w.RunOnce(ctx, f.BuildingGen)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 2)
+}
+
+func TestWorker_DownshiftDrain_TransientErrorReleasesRemainingAndErrors(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	var singletonCalls int
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: %w", ErrPermanent4xx)
+		}
+		singletonCalls++
+		if singletonCalls == 2 {
+			return nil, fmt.Errorf("temporary network failure")
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	if err == nil {
+		t.Fatalf("expected transient mid-drain error, got nil")
+	}
+	if !strings.Contains(err.Error(), "temporary network failure") {
+		t.Fatalf("expected original transient error, got %v", err)
+	}
+	if res.Succeeded != 1 {
+		t.Fatalf("Succeeded=%d, want 1 completed singleton before transient error", res.Succeeded)
+	}
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 2)
+	if available := countAvailable(t, f.VectorsDB, int64(f.BuildingGen)); available != 2 {
+		t.Fatalf("available pending rows=%d, want 2 released rows", available)
 	}
 }

@@ -185,10 +185,16 @@ func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []i
 	var conditions []string
 	var args []interface{}
 
-	if opts.SourceID != nil {
-		conditions = append(conditions, prefix+"source_id = ?")
-		args = append(args, *opts.SourceID)
-	}
+	// Exclude text messages from email-mode queries.
+	// message_type IS NULL and '' handle old data without the column.
+	conditions = append(conditions, "("+prefix+"message_type = 'email' OR "+prefix+"message_type IS NULL OR "+prefix+"message_type = '')")
+
+	// Always exclude rows soft-deleted by deduplicate.
+	conditions = append(conditions, prefix+"deleted_at IS NULL")
+
+	conditions, args = appendSourceFilter(
+		conditions, args, prefix, opts.SourceID, opts.SourceIDs,
+	)
 	if opts.After != nil {
 		conditions = append(conditions, prefix+"sent_at >= ?")
 		args = append(args, opts.After.Format("2006-01-02 15:04:05"))
@@ -251,10 +257,18 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 		prefix = tableAlias + "."
 	}
 
-	if filter.SourceID != nil {
-		conditions = append(conditions, prefix+"source_id = ?")
-		args = append(args, *filter.SourceID)
-	}
+	// Include all messages (deleted messages shown with indicator in TUI)
+
+	// Exclude text messages from email-mode queries.
+	// message_type IS NULL and '' handle old data without the column.
+	conditions = append(conditions, "("+prefix+"message_type = 'email' OR "+prefix+"message_type IS NULL OR "+prefix+"message_type = '')")
+
+	// Always exclude rows soft-deleted by deduplicate.
+	conditions = append(conditions, prefix+"deleted_at IS NULL")
+
+	conditions, args = appendSourceFilter(
+		conditions, args, prefix, filter.SourceID, filter.SourceIDs,
+	)
 
 	if filter.ConversationID != nil {
 		conditions = append(conditions, prefix+"conversation_id = ?")
@@ -871,11 +885,11 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	var args []interface{}
 	// Restrict to email messages only; NULL and '' handle pre-message_type data.
 	conditions = append(conditions, emailOnlyFilterM)
-	// Include all messages (deleted messages shown with indicator in TUI)
-	if opts.SourceID != nil {
-		conditions = append(conditions, "m.source_id = ?")
-		args = append(args, *opts.SourceID)
-	}
+	// Exclude rows soft-deleted by deduplicate.
+	conditions = append(conditions, "m.deleted_at IS NULL")
+	conditions, args = appendSourceFilter(
+		conditions, args, "m.", opts.SourceID, opts.SourceIDs,
+	)
 	if opts.WithAttachmentsOnly {
 		conditions = append(conditions, "m.has_attachments = 1")
 	}
@@ -989,13 +1003,11 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	var conditions []string
 	var args []interface{}
 
-	// Always exclude deleted messages
+	// Exclude remote-deleted and dedup-soft-deleted messages.
 	conditions = append(conditions, "m.deleted_from_source_at IS NULL")
+	conditions = append(conditions, "m.deleted_at IS NULL")
 
-	if filter.SourceID != nil {
-		conditions = append(conditions, "m.source_id = ?")
-		args = append(args, *filter.SourceID)
-	}
+	conditions, args = appendSourceFilter(conditions, args, "m.", filter.SourceID, filter.SourceIDs)
 
 	// Build JOIN clauses based on filter type
 	var joins []string
@@ -1129,6 +1141,8 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []interface{}, joins []string, ftsJoin string) {
 	// Restrict to email messages only; NULL and '' handle pre-message_type data.
 	conditions = append(conditions, emailOnlyFilterM)
+	// Exclude rows soft-deleted by deduplicate.
+	conditions = append(conditions, "m.deleted_at IS NULL")
 
 	// From filter - uses EXISTS to avoid join multiplication in aggregates.
 	// Handles both exact addresses and @domain patterns.
@@ -1276,10 +1290,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 	}
 
 	// Account filter
-	if q.AccountID != nil {
-		conditions = append(conditions, "m.source_id = ?")
-		args = append(args, *q.AccountID)
-	}
+	conditions, args = appendSourceFilter(conditions, args, "m.", nil, q.AccountIDs)
 
 	// Hide-deleted filter
 	if q.HideDeleted {
@@ -1420,9 +1431,14 @@ func MergeFilterIntoQuery(q *search.Query, filter MessageFilter) *search.Query {
 	merged.SubjectTerms = append([]string(nil), q.SubjectTerms...)
 	merged.Labels = append([]string(nil), q.Labels...)
 
-	// Account filter - always apply if set
-	if filter.SourceID != nil {
-		merged.AccountID = filter.SourceID
+	// Account filter - always apply if set. Multi-source SourceIDs takes
+	// precedence over single SourceID, matching appendSourceFilter
+	// semantics elsewhere in the package, so a future caller that sets
+	// the multi-source field on MessageFilter does not silently lose it.
+	if len(filter.SourceIDs) > 0 {
+		merged.AccountIDs = append([]int64(nil), filter.SourceIDs...)
+	} else if filter.SourceID != nil {
+		merged.AccountIDs = []int64{*filter.SourceID}
 	}
 
 	// Sender filter - append to existing from: filters

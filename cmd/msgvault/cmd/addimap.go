@@ -49,11 +49,12 @@ func choosePasswordStrategy(
 }
 
 var (
-	imapHost     string
-	imapPort     int
-	imapUsername string
-	imapNoTLS    bool
-	imapSTARTTLS bool
+	imapHost                 string
+	imapPort                 int
+	imapUsername             string
+	imapNoTLS                bool
+	imapSTARTTLS             bool
+	noDefaultIdentityAddImap bool
 )
 
 var addIMAPCmd = &cobra.Command{
@@ -148,6 +149,9 @@ Examples:
 		if err := s.InitSchema(); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
+		if err := runStartupMigrations(s); err != nil {
+			return fmt.Errorf("startup migrations: %w", err)
+		}
 
 		// Build identifier and save credentials
 		identifier := imapCfg.Identifier()
@@ -174,6 +178,10 @@ Examples:
 		// Set display name from username
 		if err := s.UpdateSourceDisplayName(source.ID, imapUsername); err != nil {
 			return fmt.Errorf("set display name: %w", err)
+		}
+
+		if !noDefaultIdentityAddImap {
+			confirmDefaultIdentity(s, source.ID, imapUsername, imapUsername, "account-identifier")
 		}
 
 		fmt.Printf("\nIMAP account added successfully!\n")
@@ -231,5 +239,6 @@ func init() {
 	addIMAPCmd.Flags().StringVar(&imapUsername, "username", "", "IMAP username / email address (required)")
 	addIMAPCmd.Flags().BoolVar(&imapNoTLS, "no-tls", false, "Disable TLS (plain connection, not recommended)")
 	addIMAPCmd.Flags().BoolVar(&imapSTARTTLS, "starttls", false, "Use STARTTLS instead of implicit TLS")
+	addIMAPCmd.Flags().BoolVar(&noDefaultIdentityAddImap, "no-default-identity", false, noDefaultIdentityHelp)
 	rootCmd.AddCommand(addIMAPCmd)
 }
