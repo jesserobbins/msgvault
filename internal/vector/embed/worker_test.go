@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wesm/msgvault/internal/vector"
 )
 
 func TestDerivedStaleThreshold(t *testing.T) {
@@ -854,65 +856,12 @@ func TestWorker_DownshiftDrain_AllDrop_StillTripsCap(t *testing.T) {
 	}
 }
 
-// TestWorker_DownshiftDrain_AllDropClean_NoSilentDelete covers the
-// most dangerous failure mode: a misconfigured endpoint (bad API
-// key, wrong model, malformed shared request config) returns 4xx
-// for every input. ErrPermanent4xx is indistinguishable from a
-// message-specific 4xx at the call site, so the worker MUST NOT
-// Complete-delete pending rows when no singleton in the drain
-// embedded — it must release them so the cap eventually trips and
-// the operator sees the failure with the original 4xx body intact
-// AND the rows still in the queue for retry after fixing the
-// config.
-func TestWorker_DownshiftDrain_AllDropClean_NoSilentDelete(t *testing.T) {
-	f := newWorkerFixture(t, 4)
-	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
-		return nil, fmt.Errorf("embed: HTTP 401: bad-api-key: %w", ErrPermanent4xx)
-	}
-	// BatchSize=2, default MaxConsecutiveFailures=5. Each iteration:
-	// upstream 4xx (cf+1), drain walks both singletons, both 4xx,
-	// drain returns wrapped ErrPermanent4xx (no double-count since
-	// the drain confirms the upstream failure rather than adding a
-	// new one), drain releases the 2 deferred IDs back to the queue.
-	// After 5 iterations the cap trips. Pending count stays at 4
-	// throughout because rows are released, not Completed.
-	w := NewWorker(WorkerDeps{
-		Backend:   f.Backend,
-		VectorsDB: f.VectorsDB,
-		MainDB:    f.MainDB,
-		Client:    f.FakeClient,
-		BatchSize: 2,
-	})
-	res, err := w.RunOnce(context.Background(), f.BuildingGen)
-	if err == nil {
-		t.Fatalf("expected cap-trip error on misconfigured endpoint, got nil")
-	}
-	if res.Succeeded != 0 {
-		t.Errorf("Succeeded: got %d, want 0 (no embeds during all-drop)", res.Succeeded)
-	}
-	if !strings.Contains(err.Error(), "consecutive failures") {
-		t.Errorf("expected cap-trip error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "bad-api-key") {
-		t.Errorf("expected original 4xx body in error, got %v", err)
-	}
-	// Critical: rows must NOT have been silently deleted. They
-	// should still be in pending_embeddings (released back, not
-	// Completed) so a corrected config can re-claim them on the
-	// next run.
-	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 4)
-}
-
-// TestWorker_SingletonBatch_4xx_NoSilentDelete verifies that a
-// BatchSize=1 claim returning ErrPermanent4xx does NOT silently
-// delete the row. The drain walks the single ID, defers the drop,
-// finds embedded == 0, releases the row back to the queue, and
-// returns the wrapped 4xx. The caller sees errors.Is(err,
-// ErrPermanent4xx) so the drain return doesn't double-count, but
-// the upstream batch failure still increments consecutiveFailures
-// once per iteration. With MaxConsecutiveFailures=3 the cap trips
-// after 3 iterations and the row remains in pending_embeddings.
-func TestWorker_SingletonBatch_4xx_NoSilentDelete(t *testing.T) {
+// TestWorker_SingletonBatch_4xx_FollowsExistingPath verifies that a
+// BatchSize=1 claim that 4xxes hits the existing release-and-fail
+// path with no downshift attempted. The release puts the row back,
+// and the next iteration claims it again — eventually tripping the
+// failure cap.
+func TestWorker_SingletonBatch_4xx_FollowsExistingPath(t *testing.T) {
 	f := newWorkerFixture(t, 1)
 	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
 		return nil, fmt.Errorf("embed: HTTP 400: bad: %w", ErrPermanent4xx)
@@ -933,6 +882,85 @@ func TestWorker_SingletonBatch_4xx_NoSilentDelete(t *testing.T) {
 		t.Errorf("expected cap abort message, got %v", err)
 	}
 	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 1)
+}
+
+// slowUpsertBackend wraps a vector.Backend and sleeps for upsertSleep
+// before delegating Upsert. Used to verify that ProgressReport's
+// pipeline-phase fields are populated with measurable durations.
+type slowUpsertBackend struct {
+	inner       vector.Backend
+	upsertSleep time.Duration
+}
+
+func (s *slowUpsertBackend) CreateGeneration(ctx context.Context, model string, dim int) (vector.GenerationID, error) {
+	return s.inner.CreateGeneration(ctx, model, dim)
+}
+func (s *slowUpsertBackend) ActivateGeneration(ctx context.Context, gen vector.GenerationID) error {
+	return s.inner.ActivateGeneration(ctx, gen)
+}
+func (s *slowUpsertBackend) RetireGeneration(ctx context.Context, gen vector.GenerationID) error {
+	return s.inner.RetireGeneration(ctx, gen)
+}
+func (s *slowUpsertBackend) ActiveGeneration(ctx context.Context) (vector.Generation, error) {
+	return s.inner.ActiveGeneration(ctx)
+}
+func (s *slowUpsertBackend) BuildingGeneration(ctx context.Context) (*vector.Generation, error) {
+	return s.inner.BuildingGeneration(ctx)
+}
+func (s *slowUpsertBackend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []vector.Chunk) error {
+	time.Sleep(s.upsertSleep)
+	return s.inner.Upsert(ctx, gen, chunks)
+}
+func (s *slowUpsertBackend) Search(ctx context.Context, gen vector.GenerationID, queryVec []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
+	return s.inner.Search(ctx, gen, queryVec, k, filter)
+}
+func (s *slowUpsertBackend) Delete(ctx context.Context, gen vector.GenerationID, messageIDs []int64) error {
+	return s.inner.Delete(ctx, gen, messageIDs)
+}
+func (s *slowUpsertBackend) Stats(ctx context.Context, gen vector.GenerationID) (vector.Stats, error) {
+	return s.inner.Stats(ctx, gen)
+}
+func (s *slowUpsertBackend) EnsureSeeded(ctx context.Context, gen vector.GenerationID) error {
+	return s.inner.EnsureSeeded(ctx, gen)
+}
+func (s *slowUpsertBackend) LoadVector(ctx context.Context, messageID int64) ([]float32, error) {
+	return s.inner.LoadVector(ctx, messageID)
+}
+func (s *slowUpsertBackend) Close() error { return s.inner.Close() }
+
+func TestProgressReport_PipelineFieldsPopulated(t *testing.T) {
+	fx := newWorkerFixture(t, 1)
+	slow := &slowUpsertBackend{inner: fx.Backend, upsertSleep: 5 * time.Millisecond}
+
+	var reports []ProgressReport
+	w := NewWorker(WorkerDeps{
+		Backend:   slow,
+		VectorsDB: fx.VectorsDB,
+		MainDB:    fx.MainDB,
+		Client:    fx.FakeClient,
+		BatchSize: 10,
+		Progress:  func(r ProgressReport) { reports = append(reports, r) },
+	})
+	if _, err := w.RunOnce(context.Background(), fx.BuildingGen); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(reports) == 0 {
+		t.Fatal("no ProgressReport emitted")
+	}
+	r := reports[0]
+	if r.UpsertElapsed < 4*time.Millisecond {
+		t.Errorf("UpsertElapsed: got %v, want >=4ms (slow upsert sleeps 5ms)", r.UpsertElapsed)
+	}
+	// ClaimElapsed and CompleteElapsed are SQLite operations measured in
+	// microseconds on fast hardware; assert only that the fields are
+	// non-negative (rules out the field being unwritten or computed
+	// from negative deltas).
+	if r.ClaimElapsed < 0 {
+		t.Errorf("ClaimElapsed negative: %v", r.ClaimElapsed)
+	}
+	if r.CompleteElapsed < 0 {
+		t.Errorf("CompleteElapsed negative: %v", r.CompleteElapsed)
+	}
 }
 
 // TestWorker_DownshiftDrain_CtxCancelMidDrain verifies that

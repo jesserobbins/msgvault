@@ -69,12 +69,23 @@ type WorkerDeps struct {
 // (fetch + preprocess + embed + upsert + complete), matching what
 // RunElapsed accumulates — so the two ratios agree.
 type ProgressReport struct {
-	Done         int
-	TotalPending int
-	BatchMsgs    int
-	BatchChars   int
-	BatchElapsed time.Duration
-	RunElapsed   time.Duration
+	Done           int
+	TotalPending   int
+	BatchMsgs      int
+	BatchChars     int
+	BatchTruncated int // number of messages in this batch whose preprocessed text was truncated
+	BatchElapsed   time.Duration
+	RunElapsed     time.Duration
+	// ClaimElapsed, UpsertElapsed, and CompleteElapsed expose the
+	// discrete phase durations measured during the success path of
+	// RunOnce. They are populated only on the all-clean success
+	// branch (no embed failure, no orphan-drain Complete failure);
+	// other progress emissions leave them zero. Consumers that don't
+	// care (e.g. the existing build-embeddings printer) can ignore
+	// them safely.
+	ClaimElapsed    time.Duration
+	UpsertElapsed   time.Duration
+	CompleteElapsed time.Duration
 }
 
 // Worker drives one building generation from claimed pending rows to
@@ -196,7 +207,9 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResul
 			return res, fmt.Errorf("RunOnce: %w", err)
 		}
 		batchStart := time.Now()
+		claimStart := batchStart
 		ids, token, err := w.q.Claim(ctx, gen, w.deps.BatchSize)
+		claimElapsed := time.Since(claimStart)
 		if err != nil {
 			return res, fmt.Errorf("claim: %w", err)
 		}
@@ -216,53 +229,72 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResul
 			lastErr = err
 			w.deps.Log.Warn("embed batch failed", "gen", gen, "ids", len(ids), "error", err)
 
-			if errors.Is(err, ErrPermanent4xx) {
-				// Walk the claimed IDs one at a time. Drain decides
-				// per-ID whether to drop (if some embed, the 4xxs are
-				// message-specific) or release (if none embed,
-				// endpoint-wide failure can't be ruled out).
-				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
+			if errors.Is(err, ErrPermanent4xx) && len(ids) > 1 {
+				// Drain the failing batch one message at a time. The
+				// IDs stay claimed under our token; we either embed
+				// or drop each one, so res accounting happens inside
+				// the drain (don't pre-charge res.Failed here).
+				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain oversize batch",
 					"gen", gen, "batch_size", len(ids))
 				embedded, dropped, drainErr := w.downshiftDrain(ctx, gen, token, ids, &res)
-				res.Succeeded += embedded
 				if drainErr != nil {
-					w.deps.Log.Info("embed: downshift drain returned error",
+					w.deps.Log.Info("embed: downshift drain interrupted",
 						"gen", gen, "batch_size", len(ids),
 						"embedded", embedded, "dropped", dropped,
+						"remaining_claimed", len(ids)-embedded-dropped,
 						"error", drainErr)
 				} else {
 					w.deps.Log.Info("embed: downshift drain complete; resuming configured batch size",
 						"gen", gen, "batch_size", len(ids),
 						"embedded", embedded, "dropped", dropped)
 				}
+				res.Succeeded += embedded
 
-				// Forward progress resets the cap. Same rule as the
-				// all-clean main-loop success path.
+				// Reset the cap first if any singletons embedded.
+				// Real progress was made — the same way a fully
+				// successful main-loop batch resets the counter.
+				// Without this reset, a partial drain (say 31 of
+				// 32 singletons embedded, 32nd hit a transient
+				// upsert error) would leave the counter at the
+				// upstream +1 plus a fresh +1 from the drain
+				// error, making forward progress harsher to
+				// recognize than non-drain forward progress.
 				if embedded > 0 {
 					consecutiveFailures = 0
 				}
 
 				if drainErr != nil {
-					// Distinguish "drain confirms upstream 4xx"
-					// (every singleton returned the same
-					// ErrPermanent4xx — same failure as the upstream
-					// batch, already counted) from "drain hit an
-					// independent error" (transient-after-retries,
-					// upsert/complete failure, ctx cancel — a fresh
-					// failure that should also count).
+					// Non-4xx interruption (transient retries
+					// exhausted, upsert/complete failure, ctx
+					// cancel). Whatever IDs remained un-Completed
+					// by the drain stay claimed for ReclaimStale
+					// to recover. The +1 here lands on top of a
+					// fresh 0 (if embedded > 0) or on top of the
+					// upstream +1 (if embedded == 0).
+					consecutiveFailures++
 					lastErr = drainErr
-					if !errors.Is(drainErr, ErrPermanent4xx) {
-						consecutiveFailures++
-					}
 					if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
 						return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
 							consecutiveFailures, lastErr)
 					}
+					continue
+				}
+				// If embedded == 0 we leave consecutiveFailures at
+				// the upstream +1 — fully misconfigured endpoints
+				// still trip the cap with the original 4xx body in
+				// lastErr. The cap check is inline (not deferred to
+				// the next iteration's failure) because an all-drop
+				// drain may have emptied the queue: the next Claim
+				// would then return zero rows and RunOnce would exit
+				// cleanly without re-evaluating the cap.
+				if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
+					return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
+						consecutiveFailures, lastErr)
 				}
 				continue
 			}
 
-			// Non-4xx error: original release-and-fail path.
+			// Non-4xx, or singleton 4xx: original release-and-fail path.
 			res.Failed += len(ids)
 			if rerr := w.q.Release(ctx, gen, token, ids); rerr != nil {
 				w.deps.Log.Error("release after embed failure", "error", rerr)
@@ -309,7 +341,10 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResul
 			continue
 		}
 
-		if err := w.deps.Backend.Upsert(ctx, gen, eb.chunks); err != nil {
+		upsertStart := time.Now()
+		err = w.deps.Backend.Upsert(ctx, gen, eb.chunks)
+		upsertElapsed := time.Since(upsertStart)
+		if err != nil {
 			res.Failed += len(eb.embeddedIDs)
 			if rerr := w.q.Release(ctx, gen, token, eb.embeddedIDs); rerr != nil {
 				w.deps.Log.Error("release after upsert failure", "error", rerr)
@@ -330,7 +365,10 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResul
 		// rescue them eventually but the next RunOnce would falsely
 		// report a clean drain in the meantime — count the batch as
 		// failed so the failure cap can short-circuit the loop.
-		if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+		completeStart := time.Now()
+		cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs)
+		completeElapsed := time.Since(completeStart)
+		if cerr != nil {
 			res.Failed += len(eb.embeddedIDs)
 			w.deps.Log.Error("complete failed", "error", cerr,
 				"gen", gen, "ids", len(eb.embeddedIDs))
@@ -396,18 +434,31 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResul
 		}
 		res.Succeeded += len(eb.embeddedIDs)
 		consecutiveFailures = 0
+		// Forward progress on real messages also retires any stale
+		// orphan-drain error from earlier iterations. Without this
+		// reset, an orphan-drain Complete failure during one batch
+		// would mask a clean run reported by the empty-claim exit
+		// even after later iterations drained without orphan
+		// problems. The originally-stuck orphan rows still wait for
+		// ReclaimStale; the next RunOnce will redrive them.
+		orphanDrainErr = nil
+		orphanDrainCount = 0
 		if w.deps.Progress != nil {
 			batchChars := 0
 			for _, c := range eb.chunks {
 				batchChars += c.SourceCharLen
 			}
 			w.deps.Progress(ProgressReport{
-				Done:         res.Succeeded,
-				TotalPending: w.deps.TotalPending,
-				BatchMsgs:    len(eb.embeddedIDs),
-				BatchChars:   batchChars,
-				BatchElapsed: time.Since(batchStart),
-				RunElapsed:   time.Since(w.runStart),
+				Done:            res.Succeeded,
+				TotalPending:    w.deps.TotalPending,
+				BatchMsgs:       len(eb.embeddedIDs),
+				BatchChars:      batchChars,
+				BatchTruncated:  eb.truncated,
+				BatchElapsed:    time.Since(batchStart),
+				RunElapsed:      time.Since(w.runStart),
+				ClaimElapsed:    claimElapsed,
+				UpsertElapsed:   upsertElapsed,
+				CompleteElapsed: completeElapsed,
 			})
 		}
 	}
@@ -537,41 +588,28 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	}, nil
 }
 
-// downshiftDrain handles a non-retryable 4xx on a claimed batch by
-// walking the same already-claimed IDs one at a time. The IDs remain
-// owned under the caller's claim_token throughout the drain, so we
-// never re-Claim them — that would race other workers.
-//
-// Singleton 4xxs are NOT eagerly Completed. ErrPermanent4xx covers
-// both message-specific failures (413 payload-too-large, 422
-// Unprocessable, 400 invalid-input) and endpoint/config-wide
-// failures (401 bad-key, 403 forbidden, 404 invalid-model, 400
-// malformed-shared-config) — the two are indistinguishable at the
-// call site. If we Complete-deleted on every singleton 4xx, a
-// misconfigured endpoint would silently destroy work. Instead we
-// defer the drop decision: collect the 4xxing IDs, and at end of
-// drain decide based on whether anything embedded.
+// downshiftDrain handles a non-retryable 4xx on a multi-message batch
+// by walking the same already-claimed IDs one at a time. The IDs
+// remain owned under the caller's claim_token throughout the drain,
+// so we never Release/re-Claim them — that would race other workers.
 //
 // Returned `embedded` is the count of singletons that successfully
-// embedded.
+// embedded; the caller uses this to decide whether to reset
+// consecutiveFailures (>=1 means real progress was made) or preserve
+// the upstream +1 (==0 means every message was dropped, which on a
+// fully misconfigured endpoint should still trip the abort cap).
 //
-// Returned `dropped` is the count of singletons whose drop was
-// confirmed (Complete succeeded). A drain that releases its deferred
-// IDs back to the queue (because no singleton embedded) returns
-// `dropped == 0`.
+// Returned `err` is non-nil only for non-4xx interruptions (transient
+// errors that exhausted retries inside embedBatch, upsert failures,
+// complete failures, ctx cancellation). The caller treats these like
+// the existing upsert-error path: increment consecutiveFailures and
+// abort if the cap is reached.
 //
-// Returned `err`:
-//   - non-nil all-drop: every singleton 4xxd, no embeds. Deferred
-//     IDs were Released back to the queue (so a misconfigured
-//     endpoint does not lose work) and the wrapped 4xx is returned.
-//     The caller increments consecutiveFailures and the cap will
-//     eventually trip, surfacing the original 4xx body.
-//   - non-nil non-4xx interruption: transient errors that exhausted
-//     retries inside embedBatch, upsert/complete failures, ctx
-//     cancellation. Deferred and unprocessed IDs stay claimed for
-//     ReclaimStale to recover.
-//   - nil: drain completed cleanly. If `embedded > 0` and there were
-//     deferred IDs, they were Completed as message-specific drops.
+// Singleton 4xxs are dropped (Complete with no embedding, mirroring
+// the empty-input drain) and do NOT count toward consecutiveFailures
+// — the empty-input fix already established this pattern. The
+// caller's "drain embedded zero" rule provides the safety net
+// against silent total-drop.
 func (w *Worker) downshiftDrain(
 	ctx context.Context,
 	gen vector.GenerationID,
@@ -579,9 +617,6 @@ func (w *Worker) downshiftDrain(
 	ids []int64,
 	res *RunResult,
 ) (embedded int, dropped int, err error) {
-	var deferredDrops []int64
-	var lastDeferredErr error
-
 	for _, id := range ids {
 		select {
 		case <-ctx.Done():
@@ -592,11 +627,22 @@ func (w *Worker) downshiftDrain(
 		batchStart := time.Now()
 		eb, e := w.embedBatch(ctx, []int64{id})
 		if e != nil {
+			// Singleton 4xx: drop. Anything else: bail.
+			//
+			// Successful drops do not increment res.Failed —
+			// dropping an unembeddable message is the worker
+			// acknowledging the queue, not a failure to process
+			// it. Matches the main loop's behavior for missing /
+			// empty-preprocess drops, where res.Failed is only
+			// charged when Complete itself errors.
 			if errors.Is(e, ErrPermanent4xx) {
-				// Defer the drop decision. See function-level
-				// comment for the endpoint-vs-message distinction.
-				deferredDrops = append(deferredDrops, id)
-				lastDeferredErr = e
+				w.deps.Log.Warn("dropping pending message after singleton 4xx",
+					"gen", gen, "id", id, "error", e)
+				if cerr := w.q.Complete(ctx, gen, token, []int64{id}); cerr != nil {
+					res.Failed++
+					return embedded, dropped, fmt.Errorf("complete drop: %w", cerr)
+				}
+				dropped++
 				continue
 			}
 			return embedded, dropped, e
@@ -627,49 +673,17 @@ func (w *Worker) downshiftDrain(
 				batchChars += c.SourceCharLen
 			}
 			w.deps.Progress(ProgressReport{
-				Done:         res.Succeeded + embedded,
-				TotalPending: w.deps.TotalPending,
-				BatchMsgs:    len(eb.embeddedIDs),
-				BatchChars:   batchChars,
-				BatchElapsed: time.Since(batchStart),
-				RunElapsed:   time.Since(w.runStart),
+				Done:           res.Succeeded + embedded,
+				TotalPending:   w.deps.TotalPending,
+				BatchMsgs:      len(eb.embeddedIDs),
+				BatchChars:     batchChars,
+				BatchTruncated: eb.truncated,
+				BatchElapsed:   time.Since(batchStart),
+				RunElapsed:     time.Since(w.runStart),
 			})
 		}
 	}
-
-	// Drain finished. Decide deferred-drop fate.
-	if len(deferredDrops) == 0 {
-		return embedded, dropped, nil
-	}
-	if embedded > 0 {
-		// Endpoint works for some messages, so the 4xxs are
-		// message-specific (oversize input, malformed input, etc.).
-		// Drop them.
-		for _, id := range deferredDrops {
-			w.deps.Log.Warn("dropping pending message after singleton 4xx",
-				"gen", gen, "id", id, "error", lastDeferredErr)
-		}
-		if cerr := w.q.Complete(ctx, gen, token, deferredDrops); cerr != nil {
-			res.Failed += len(deferredDrops)
-			return embedded, dropped, fmt.Errorf("complete drop: %w", cerr)
-		}
-		dropped += len(deferredDrops)
-		return embedded, dropped, nil
-	}
-	// embedded == 0. We can't distinguish endpoint-wide failure from a
-	// batch where every message just happened to be unembeddable.
-	// Release the deferred IDs (rather than Completing them) so a
-	// misconfigured endpoint does not silently destroy work, and
-	// return the wrapped 4xx so the caller surfaces it. The released
-	// IDs go back to the pending queue and will be re-claimed; if the
-	// underlying problem persists, the consecutive-failure cap will
-	// eventually trip with the same 4xx body in lastErr.
-	if rerr := w.q.Release(ctx, gen, token, deferredDrops); rerr != nil {
-		w.deps.Log.Error("release after all-drop drain", "error", rerr,
-			"gen", gen, "ids", len(deferredDrops))
-	}
-	return embedded, dropped, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (released %d row(s) back to queue): %w",
-		len(deferredDrops), lastDeferredErr)
+	return embedded, dropped, nil
 }
 
 func totalChars(ms []msgText) int {
