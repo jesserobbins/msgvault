@@ -185,3 +185,32 @@ type FusedHit struct {
 	VectorScore    float64 // math.NaN() if missing
 	SubjectBoosted bool
 }
+
+// BenchBackend is an optional capability for benchmark generation
+// lifecycle: creating throwaway generations isolated from the
+// production activate/retire flow, and dropping them safely. The
+// embedshootout harness type-asserts a Backend to BenchBackend at
+// run time; production code (sync, build-embeddings, hybrid search)
+// does not see these methods and cannot accidentally call them. Same
+// optional-capability pattern as FusingBackend.
+type BenchBackend interface {
+	Backend
+
+	// CreateBenchGeneration creates a generation in `building` state
+	// whose fingerprint is forced to begin with "bench:" — concretely
+	// "bench:<runScope>:<model>:<dimension>" — so it cannot be
+	// confused with a production generation. Implementations MUST
+	// skip the production seed pass that CreateGeneration performs
+	// (the bench caller seeds pending_embeddings explicitly with a
+	// sample-bounded set), and MUST stamp seeded_at to a non-NULL
+	// value so EnsureSeeded resume-paths treat the gen as already
+	// seeded. The runScope must be non-empty.
+	CreateBenchGeneration(ctx context.Context, model string, dimension int, runScope string) (GenerationID, error)
+
+	// DropGeneration removes a generation and its associated rows
+	// (vectors, pending_embeddings, index_generations row).
+	// Implementations MUST verify the fingerprint begins with
+	// "bench:" and return an error otherwise — this is a hard
+	// contractual safety on top of any caller-side check.
+	DropGeneration(ctx context.Context, gen GenerationID) error
+}
