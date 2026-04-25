@@ -17,7 +17,7 @@ LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 # - sqlite_vec: enable the sqlite-vec extension for vector search
 BUILD_TAGS := fts5 sqlite_vec
 
-.PHONY: build build-release install clean test test-v fmt lint lint-ci tidy shootout run-shootout install-hooks bench help
+.PHONY: build build-release install clean test test-v fmt lint lint-ci tidy shootout run-shootout embedshootout run-embedshootout install-hooks bench help
 
 # Build the binary (debug)
 build:
@@ -47,7 +47,7 @@ install:
 
 # Clean build artifacts
 clean:
-	rm -f msgvault msgvault.exe mimeshootout
+	rm -f msgvault msgvault.exe mimeshootout embedshootout
 	rm -rf bin/
 
 # Run tests
@@ -109,6 +109,14 @@ shootout:
 run-shootout: shootout
 	./mimeshootout -limit 1000
 
+# Build the embedding shootout tool
+embedshootout:
+	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -o embedshootout ./scripts/embedshootout
+
+# Smoke pass: single endpoint cell against a sample named 'default'
+run-embedshootout: embedshootout
+	./embedshootout run -mode endpoint -sample default -batch-size 32 -workers 1
+
 # Show help
 help:
 	@echo "msgvault build targets:"
@@ -126,6 +134,8 @@ help:
 	@echo "  install-hooks  - Install pre-commit hook via prek"
 	@echo "  clean          - Remove build artifacts"
 	@echo ""
-	@echo "  bench          - Run query engine benchmarks"
-	@echo "  shootout       - Build MIME shootout tool"
-	@echo "  run-shootout   - Run MIME shootout"
+	@echo "  bench              - Run query engine benchmarks"
+	@echo "  shootout           - Build MIME shootout tool"
+	@echo "  run-shootout       - Run MIME shootout"
+	@echo "  embedshootout      - Build embedding shootout tool"
+	@echo "  run-embedshootout  - Run embedding shootout (requires sample 'default')"

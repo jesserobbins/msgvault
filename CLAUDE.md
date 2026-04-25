@@ -72,6 +72,10 @@ make lint                     # Run linter
 
 # Maintenance
 ./msgvault repair-encoding                            # Fix UTF-8 encoding issues
+
+# Embedding benchmark (developer tool — see docs/embedshootout.md)
+make embedshootout                                    # Build ./embedshootout
+./embedshootout help                                  # Verb list
 ```
 
 ## Key Files
