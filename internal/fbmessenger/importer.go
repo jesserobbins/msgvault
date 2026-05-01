@@ -303,6 +303,14 @@ func ImportDYI(ctx context.Context, st *store.Store, opts ImportOptions) (*Impor
 			// run, so a transient failure (DB lock, I/O blip) self-
 			// heals. If the error is persistent the user will see
 			// HardErrors=true and can rerun with --no-resume.
+			//
+			// Invariant: cumulative counters live on summary.* during
+			// the run; cp.Messages{Processed,Added,Errors} are only
+			// written inside saveFbmessengerCheckpoint. Skipping the
+			// post-success persistence here therefore strands no
+			// counter state — the next checkpoint write (after a
+			// later successful thread, or at run end) syncs from
+			// summary.*.
 			continue
 		}
 		// Persist per-thread checkpoint so resume can skip fully

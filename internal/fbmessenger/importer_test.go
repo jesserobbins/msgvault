@@ -952,10 +952,14 @@ func TestImportDYI_ResumeFromFirstThreadCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Seed distinctive counters so a passing assertion proves carry-over
+	// rather than accidentally matching what a fresh import would yield.
+	const priorProcessed int64 = 999
+	const priorAdded int64 = 999
 	if err := st.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
 		PageToken:         string(cpJSON),
-		MessagesProcessed: 1,
-		MessagesAdded:     1,
+		MessagesProcessed: priorProcessed,
+		MessagesAdded:     priorAdded,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -967,9 +971,15 @@ func TestImportDYI_ResumeFromFirstThreadCheckpoint(t *testing.T) {
 	if !summary.WasResumed {
 		t.Errorf("WasResumed=false, want true for first-thread checkpoint")
 	}
-	// Cumulative counters must carry over from the prior run.
-	if summary.MessagesProcessed < 1 {
-		t.Errorf("MessagesProcessed=%d, want carry-over from prior run (>=1)", summary.MessagesProcessed)
+	// Cumulative counters must carry over from the prior run, so the
+	// final summary must exceed the seeded prior values. A fresh
+	// import of the 2-thread fixture would yield single-digit counters
+	// — anything ≥ priorProcessed proves carry-over.
+	if summary.MessagesProcessed < priorProcessed {
+		t.Errorf("MessagesProcessed=%d, want >=%d (prior carry-over)", summary.MessagesProcessed, priorProcessed)
+	}
+	if summary.MessagesAdded < priorAdded {
+		t.Errorf("MessagesAdded=%d, want >=%d (prior carry-over)", summary.MessagesAdded, priorAdded)
 	}
 }
 
