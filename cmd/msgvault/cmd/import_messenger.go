@@ -14,11 +14,12 @@ import (
 )
 
 var (
-	importMessengerMe              string
-	importMessengerFormat          string
-	importMessengerLimit           int
-	importMessengerNoResume        bool
-	importMessengerCheckpointEvery int
+	importMessengerMe                string
+	importMessengerFormat            string
+	importMessengerLimit             int
+	importMessengerNoResume          bool
+	importMessengerCheckpointEvery   int
+	noDefaultIdentityImportMessenger bool
 )
 
 var importMessengerCmd = &cobra.Command{
@@ -117,6 +118,16 @@ func runImportMessenger(cmd *cobra.Command, rootDir string) error {
 		return fmt.Errorf("import failed: %w", err)
 	}
 
+	if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportMessenger {
+		// fbmessenger.ImportSummary doesn't expose SourceID; re-resolve via the
+		// idempotent GetOrCreateSource the importer itself uses.
+		if src, err := s.GetOrCreateSource("facebook_messenger", importMessengerMe); err != nil {
+			logger.Warn("auto-default-identity: source lookup failed", "identifier", importMessengerMe, "error", err.Error())
+		} else {
+			confirmDefaultIdentity(s, src.ID, importMessengerMe, importMessengerMe, "account-identifier")
+		}
+	}
+
 	_, _ = fmt.Fprintln(cmd.OutOrStdout())
 	if summary.WasResumed {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Resumed from checkpoint.")
@@ -151,6 +162,7 @@ func init() {
 	importMessengerCmd.Flags().IntVar(&importMessengerLimit, "limit", 0, "limit number of messages (for testing)")
 	importMessengerCmd.Flags().BoolVar(&importMessengerNoResume, "no-resume", false, "ignore any existing checkpoint and start fresh")
 	importMessengerCmd.Flags().IntVar(&importMessengerCheckpointEvery, "checkpoint-interval", 200, "checkpoint every N messages")
+	importMessengerCmd.Flags().BoolVar(&noDefaultIdentityImportMessenger, "no-default-identity", false, noDefaultIdentityHelp)
 	_ = importMessengerCmd.MarkFlagRequired("me")
 	rootCmd.AddCommand(importMessengerCmd)
 }
