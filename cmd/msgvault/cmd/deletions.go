@@ -227,26 +227,16 @@ By default, messages are permanently deleted using batch API (fast, no recovery)
 Use --trash to move messages to Gmail trash instead (recoverable for 30 days, slower).
 
 Execution is gated for the v1 release. Set MSGVAULT_ENABLE_REMOTE_DELETE=1 to
-opt in. Listing and inspecting staged batches works without the gate.
+opt in. Read-only modes (--list, --dry-run) work without the gate.
 
 Examples:
   msgvault delete-staged --list         # Show staged batches (always allowed)
+  msgvault delete-staged --dry-run      # Preview without executing (always allowed)
   MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged
   MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged batch-123
   MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --trash
   MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --yes`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// --list is read-only and always permitted; everything else
-		// would invoke the Gmail-API executor and is gated for v1.
-		if !deleteList && !remoteDeleteEnabled() {
-			return fmt.Errorf(
-				"remote deletion is gated in this release; "+
-					"set %s=1 to opt in. "+
-					"Use 'msgvault delete-staged --list' to inspect staged batches "+
-					"without executing.",
-				remoteDeleteEnvVar,
-			)
-		}
 		deletionsDir := filepath.Join(cfg.Data.DataDir, "deletions")
 		manager, err := deletion.NewManager(deletionsDir)
 		if err != nil {
@@ -329,6 +319,18 @@ Examples:
 		if deleteDryRun {
 			fmt.Println("Dry run - no messages will be deleted.")
 			return nil
+		}
+
+		// Gate the destructive Gmail-API call for the v1 release.
+		// --list and --dry-run already returned above without hitting this.
+		if !remoteDeleteEnabled() {
+			return fmt.Errorf(
+				"remote deletion is gated in this release; "+
+					"set %s=1 to opt in. "+
+					"Use 'msgvault delete-staged --list' or --dry-run to inspect "+
+					"staged batches without executing.",
+				remoteDeleteEnvVar,
+			)
 		}
 
 		// Require confirmation

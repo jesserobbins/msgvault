@@ -220,16 +220,17 @@ MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged <batch-id>
 # Move to trash instead (recoverable for 30 days, slower)
 MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --trash
 
-# Dry run — show what would be deleted without doing it
-MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --dry-run
+# Dry run — show what would be deleted without doing it (always allowed)
+msgvault delete-staged --dry-run
 
 # Specify which account to delete from
 MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --account user@gmail.com
 ```
 
-**Note:** Remote deletion is gated for the v1 release. Staging, listing, and
-inspecting deletion batches works without the gate; executing against Gmail
-requires `MSGVAULT_ENABLE_REMOTE_DELETE=1` in the environment.
+**Note:** Remote deletion is gated for the v1 release. Staging, listing,
+inspecting, and dry-running deletion batches works without the gate;
+executing against Gmail requires `MSGVAULT_ENABLE_REMOTE_DELETE=1` in the
+environment.
 
 **Warning:** `delete-staged` without `--trash` permanently deletes messages from
 Gmail. This is irreversible. Always verify with `--dry-run` first.
